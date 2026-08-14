@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Quote"
+  short_description: "Check stock prices from the terminal"
+  default_prompt: "Use $stock-quote to check the latest available price for AAPL."
