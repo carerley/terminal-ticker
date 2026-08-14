@@ -1,0 +1,81 @@
+name: Update terminal-ticker
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-terminal-ticker
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -xeuo pipefail {0}
+
+jobs:
+  update:
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - name: Set up Homebrew
+        id: setup
+        uses: Homebrew/actions/setup-homebrew@fd832223f9f99ebf0244dd20658680e5d4aca049 # 2026.08.03.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up git identity
+        id: git
+        uses: Homebrew/actions/git-user-config@fd832223f9f99ebf0244dd20658680e5d4aca049 # 2026.08.03.2
+
+      - name: Find, verify, and publish the newest stable tag
+        env:
+          TAP_NAME: ${{ steps.setup.outputs.tap-name }}
+        run: |
+          tap_path="$(brew --repo "$TAP_NAME")"
+          formula="$tap_path/Formula/terminal-ticker.rb"
+
+          latest_tag="$({
+            git ls-remote --tags --refs https://github.com/carerley/terminal-ticker.git |
+              awk '{print $2}' |
+              sed 's#refs/tags/##' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              sort -V
+          } | tail -n 1)"
+          test -n "$latest_tag"
+
+          current_tag="$(sed -nE 's#.*tags/(v[0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz.*#\1#p' "$formula")"
+          if [[ "$latest_tag" == "$current_tag" ]]; then
+            echo "terminal-ticker is already current at $latest_tag"
+            exit 0
+          fi
+
+          archive_url="https://github.com/carerley/terminal-ticker/archive/refs/tags/$latest_tag.tar.gz"
+          archive="$RUNNER_TEMP/terminal-ticker-$latest_tag.tar.gz"
+          curl --fail --location --retry 3 "$archive_url" --output "$archive"
+          sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+
+          python3 - "$formula" "$archive_url" "$sha256" <<'PYTHON'
+          import re
+          import sys
+          from pathlib import Path
+
+          path, archive_url, sha256 = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+          text = path.read_text()
+          text, url_count = re.subn(r'  url "[^"]+"', f'  url "{archive_url}"', text, count=1)
+          text, sha_count = re.subn(r'  sha256 "[0-9a-f]{64}"', f'  sha256 "{sha256}"', text, count=1)
+          if (url_count, sha_count) != (1, 1):
+              raise SystemExit("formula URL or checksum field was not found exactly once")
+          path.write_text(text)
+          PYTHON
+
+          brew audit --strict "$TAP_NAME/terminal-ticker"
+          brew install --build-from-source "$TAP_NAME/terminal-ticker"
+          brew test "$TAP_NAME/terminal-ticker"
+
+          cd "$tap_path"
+          git add Formula/terminal-ticker.rb
+          git diff --cached --check
+          git commit -m "terminal-ticker ${latest_tag#v}"
+          git push origin HEAD:main

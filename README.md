@@ -21,4 +21,8 @@ command and consumes its JSON output.
 rate-limited, or changed without notice, so this tool is intended for quick
 informational checks rather than trading decisions.
 
+After creating a stable `vX.Y.Z` tag, run **Update terminal-ticker** from the
+tap repository's Actions page. It detects the newest tag, verifies the archive,
+updates the checksum, tests the formula, and publishes the change.
+
 Run tests with `python3 -m unittest discover -s tests -v`.
