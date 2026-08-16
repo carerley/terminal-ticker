@@ -45,7 +45,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="ticker", description="Quick no-key stock quotes and portfolio trends"
     )
-    result.add_argument("symbols", nargs="*", help="ticker symbols, or list/forget/clear")
+    result.add_argument("symbols", nargs="*", help="ticker symbols, or add/remove/list/clear")
     result.add_argument("--json", action="store_true", help="emit stable JSON")
     result.add_argument("--compact", action="store_true", help="print one compact line per symbol")
     result.add_argument(
@@ -54,7 +54,7 @@ def parser() -> argparse.ArgumentParser:
         const="1m",
         choices=CHART_PERIODS,
         metavar="PERIOD",
-        help="show a 1d, 1w, 1m, 3m, ytd, or all-period chart",
+        help="show a 1d, 1w, 1m, 3m, 6m, 1y, 3y, 5y, ytd, or all-period chart",
     )
     result.add_argument("--no-chart", action="store_true", help="hide portfolio sparklines")
     result.add_argument("--ascii", action="store_true", help="use ASCII charts")
@@ -88,6 +88,17 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
 
     portfolio = Portfolio()
     command = args.symbols[0].lower() if args.symbols else None
+    if command == "add":
+        symbols = normalize(args.symbols[1:])
+        if not symbols:
+            print("ticker: add requires at least one symbol", file=sys.stderr)
+            return 2
+        added = portfolio.add(symbols)
+        if args.json:
+            print(json.dumps({"added": added}))
+        else:
+            print("Added " + ", ".join(added) + "." if added else "Symbols already listed.")
+        return 0
     if command == "clear":
         if len(args.symbols) != 1:
             print("ticker: clear does not accept symbols", file=sys.stderr)
@@ -95,9 +106,9 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
         count = portfolio.clear()
         print(json.dumps({"cleared": count}) if args.json else f"Cleared {count} symbols.")
         return 0
-    if command == "forget":
+    if command in {"forget", "remove"}:
         if len(args.symbols) < 2:
-            print("ticker: forget requires at least one symbol", file=sys.stderr)
+            print("ticker: remove requires at least one symbol", file=sys.stderr)
             return 2
         removed = portfolio.forget([symbol.upper() for symbol in args.symbols[1:]])
         if args.json:
@@ -113,6 +124,25 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
     with profiler.span("load_portfolio"):
         entries = portfolio.entries() if portfolio_mode else []
     if portfolio_mode and not entries:
+        empty_interactive = (
+            not args.symbols
+            and not args.json
+            and not args.no_interactive
+            and not profiler.enabled
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        )
+        if empty_interactive:
+            try:
+                run_progressive_portfolio(
+                    [], None if args.no_chart else (args.chart or "1m"), args.ascii,
+                    YahooProvider(profiler=profiler),
+                    FundamentalsProvider(profiler=profiler),
+                    portfolio, portfolio.preferences(),
+                )
+                return 0
+            except curses.error:
+                pass
         print("[]" if args.json else "No recent symbols. Try: ticker AAPL")
         return 0
 
@@ -136,7 +166,8 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
     if interactive:
         try:
             run_progressive_portfolio(
-                entries, period, args.ascii, provider, fundamentals_provider
+                entries, period, args.ascii, provider, fundamentals_provider,
+                portfolio, portfolio.preferences(),
             )
             return 0
         except curses.error:

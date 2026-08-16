@@ -16,6 +16,10 @@ PERIODS = {
     "1w": ("5d", "30m"),
     "1m": ("1mo", "1d"),
     "3m": ("3mo", "1d"),
+    "6m": ("6mo", "1d"),
+    "1y": ("1y", "1d"),
+    "3y": ("3y", "1wk"),
+    "5y": ("5y", "1wk"),
     "ytd": ("ytd", "1d"),
 }
 
@@ -264,7 +268,7 @@ def _previous_session_close(
 def _regular_session_points(
     pairs: list[tuple[int, float]], meta: dict[str, Any], interval: str
 ) -> list[tuple[int, float]]:
-    if interval == "1d":
+    if interval in {"1d", "1wk"}:
         return pairs
     regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
     start, end = int(regular.get("start", 0)), int(regular.get("end", 0))
