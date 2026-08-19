@@ -7,11 +7,13 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
-from .community import DEFAULT_MEMBERS, CommunityMember
-from .core import Quote, QuoteError, Trend, YahooProvider
+from .community import DEFAULT_MEMBERS, CommunityHolding, CommunityMember
+from .core import ExtendedHours, Quote, QuoteError, Trend, YahooProvider
 from .fundamentals import Fundamentals, FundamentalsProvider
+from .identity import DeviceIdentity, IdentityError
 from .portfolio import Portfolio, PortfolioEntry, Preferences
 from .render import compact_number, money, pe_text, percent, sparkline
+from .stream import LiveQuote, QuoteStream
 
 
 @dataclass
@@ -62,9 +64,9 @@ class AppLayout:
     footer_y: int
 
 
-def calculate_layout(width: int, height: int) -> AppLayout:
-    sidebar_width = 24 if width >= 100 else 0
-    chat_y = max(4, height - 2)
+def calculate_layout(width: int, height: int, show_sidebar: bool = True) -> AppLayout:
+    sidebar_width = 24 if show_sidebar and width >= 100 else 0
+    chat_y = max(4, height - 3)
     return AppLayout(
         width=width,
         height=height,
@@ -93,7 +95,10 @@ def move_selection(selected: int, key: int, count: int) -> int:
 
 
 def run_portfolio(rows: list[PortfolioRow], period: str | None, ascii_only: bool) -> None:
-    curses.wrapper(_run, rows, period, ascii_only, None, Preferences(), None, None, None, None)
+    curses.wrapper(
+        _run, rows, period, ascii_only, None, Preferences(), (), False,
+        None, None, None, None, None, None,
+    )
 
 
 def run_progressive_portfolio(
@@ -109,6 +114,22 @@ def run_progressive_portfolio(
     rows = [PortfolioRow(entry.symbol, entry.last_queried, entry.added_at) for entry in entries]
     updates: queue.SimpleQueue[tuple[str, str, object]] = queue.SimpleQueue()
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ticker")
+    stream = QuoteStream(
+        [entry.symbol for entry in entries],
+        lambda quote: updates.put((quote.symbol, "live_quote", quote)),
+    )
+    stream.start()
+    identity = DeviceIdentity()
+    try:
+        online_members = tuple(
+            CommunityMember.from_directory(value)
+            for value in identity.community_members(limit=50)
+        )
+        members = online_members or DEFAULT_MEMBERS
+        community_joined = True
+    except IdentityError:
+        members = DEFAULT_MEMBERS
+        community_joined = False
 
     def trend_done(symbol: str, kind: str, future: Future[Trend]) -> None:
         try:
@@ -174,13 +195,28 @@ def run_progressive_portfolio(
             return False
         now = int(time.time())
         rows.insert(0, PortfolioRow(symbol, now, now))
+        stream.subscribe(symbol)
         submit_symbol(symbol)
         return True
 
     def remove_symbol(symbol: str) -> None:
         portfolio.forget([symbol])
+        stream.unsubscribe(symbol)
 
     def load_member(member: CommunityMember) -> list[PortfolioRow]:
+        if not member.holdings:
+            profile = identity.community_profile(member.handle)
+            user = profile.get("user", {})
+            watchlist = profile.get("list", {})
+            items = watchlist.get("items", []) if isinstance(watchlist, dict) else []
+            member.name = str(user.get("display_name") or member.handle) if isinstance(user, dict) else member.handle
+            member.manager = str(user.get("bio") or "Community member") if isinstance(user, dict) else "Community member"
+            member.report_date = str(watchlist.get("updated_at") or "")[:10] if isinstance(watchlist, dict) else ""
+            member.holdings = tuple(
+                CommunityHolding(str(item["symbol"]).upper())
+                for item in items
+                if isinstance(item, dict) and item.get("symbol")
+            )
         member_rows = [
             PortfolioRow(
                 holding.symbol,
@@ -194,12 +230,24 @@ def run_progressive_portfolio(
             submit_symbol(row.symbol)
         return member_rows
 
+    def join_community(display_name: str) -> tuple[CommunityMember, ...]:
+        identity.join_community(display_name)
+        return tuple(
+            CommunityMember.from_directory(value)
+            for value in identity.community_members(limit=50)
+        )
+
+    def send_feedback(message: str) -> None:
+        identity.send_feedback(message)
+
     try:
         curses.wrapper(
             _run, rows, period, ascii_only, updates, preferences,
-            portfolio.save_preferences, add_symbol, remove_symbol, load_member,
+            members, community_joined, portfolio.save_preferences,
+            add_symbol, remove_symbol, load_member, join_community, send_feedback,
         )
     finally:
+        stream.stop()
         executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -210,10 +258,14 @@ def _run(
     ascii_only: bool,
     updates: queue.SimpleQueue[tuple[str, str, object]] | None,
     preferences: Preferences,
+    members: tuple[CommunityMember, ...],
+    community_joined: bool,
     save_preferences: object | None,
     add_symbol: object | None,
     remove_symbol: object | None,
     load_member: object | None,
+    join_community: object | None,
+    send_feedback: object | None,
 ) -> None:
     try:
         curses.curs_set(0)
@@ -244,7 +296,12 @@ def _run(
     member_sort_column: str | None = None
     member_sort_descending = False
     focused_column: str | None = None
-    input_message = "Press / to send feedback"
+    input_message = (
+        "Join Community to view others' lists and share your watchlist? y/n"
+        if preferences.active_tab == "community"
+        and not community_joined
+        else "Press / to send feedback"
+    )
     offset = 0
     while True:
         active_rows = member_rows.get(opened_member, []) if opened_member is not None else rows
@@ -266,7 +323,9 @@ def _run(
                 min(selected or 0, max(0, len(active_rows) - 1)),
             )
         height, width = screen.getmaxyx()
-        layout = calculate_layout(width, height)
+        layout = calculate_layout(
+            width, height, show_sidebar=preferences.active_tab == "community"
+        )
         visible = max(1, layout.body_height - (4 if opened_member is not None else 3))
         if selected is not None and selected < offset:
             offset = selected
@@ -285,7 +344,8 @@ def _run(
             preferences,
             focused_column,
             selected_member,
-            DEFAULT_MEMBERS[opened_member] if opened_member is not None else None,
+            members,
+            members[opened_member] if opened_member is not None else None,
             active_sort_column,
             active_sort_descending,
             input_message,
@@ -313,46 +373,88 @@ def _run(
             focused_column = None
             if callable(save_preferences):
                 save_preferences(preferences)
+            input_message = (
+                "Join Community to view others' lists and share your watchlist? y/n"
+                if preferences.active_tab == "community" and not community_joined
+                else "Press / to send feedback"
+            )
             continue
         if key == ord("/"):
             entered = _prompt_input(screen, layout.chat_y, width, "/")
             if entered:
-                input_message = "Feedback sending is not configured yet"
+                if callable(send_feedback):
+                    try:
+                        send_feedback(entered.removeprefix("/"))
+                        input_message = "Feedback sent — thank you"
+                    except IdentityError:
+                        input_message = "Unable to send feedback"
             continue
         if preferences.active_tab == "community":
+            if not community_joined and key in (ord("y"), ord("Y")):
+                if callable(join_community):
+                    display_name = _prompt_name(screen, layout.chat_y)
+                    if not display_name:
+                        input_message = "Community join cancelled"
+                        continue
+                    try:
+                        refreshed = join_community(display_name)
+                        members = refreshed or members
+                        community_joined = True
+                        selected_member = None
+                        input_message = "Joined Community — your watchlist is now shared"
+                    except IdentityError:
+                        input_message = "Unable to join Community"
+                continue
+            if not community_joined and key in (ord("n"), ord("N")):
+                input_message = "Community join dismissed"
+                continue
+            if not members:
+                input_message = "No community members available"
+                continue
             if opened_member is None and key in (curses.KEY_UP, ord("k")):
                 selected_member = (
-                    len(DEFAULT_MEMBERS) - 1
+                    len(members) - 1
                     if selected_member is None
-                    else (selected_member - 1) % len(DEFAULT_MEMBERS)
+                    else (selected_member - 1) % len(members)
                 )
             elif opened_member is None and key in (curses.KEY_DOWN, ord("j")):
                 selected_member = (
-                    0 if selected_member is None else (selected_member + 1) % len(DEFAULT_MEMBERS)
+                    0 if selected_member is None else (selected_member + 1) % len(members)
                 )
             elif opened_member is None and key in (curses.KEY_ENTER, 10, 13) and selected_member is not None:
                 if selected_member not in member_rows and callable(load_member):
-                    member_rows[selected_member] = load_member(DEFAULT_MEMBERS[selected_member])
+                    try:
+                        member_rows[selected_member] = load_member(members[selected_member])
+                    except IdentityError:
+                        input_message = "Unable to load community watchlist"
+                        continue
                 opened_member = selected_member
                 selected = None
                 focused_column = None
                 offset = 0
             if opened_member is None:
                 continue
-        is_member_portfolio = opened_member is not None
+        is_member_view = opened_member is not None
+        is_demo_portfolio = (
+            opened_member is not None and bool(members[opened_member].reporting_period)
+        )
         columns = view_columns(
             preferences.view,
             any(row.quote and row.quote.extended_hours for row in active_rows),
-            is_member_portfolio,
+            is_demo_portfolio,
         )
         if key == ord("v"):
             views = ["basic", "extended", "study"]
             preferences.view = views[(views.index(preferences.view) + 1) % len(views)]
             if preferences.sort_column not in view_columns(preferences.view, False):
                 preferences.sort_column = None
-            if member_sort_column not in view_columns(preferences.view, False, True):
+            if member_sort_column not in view_columns(
+                preferences.view, False, is_demo_portfolio
+            ):
                 member_sort_column = None
-            if focused_column not in view_columns(preferences.view, False, is_member_portfolio):
+            if focused_column not in view_columns(
+                preferences.view, False, is_demo_portfolio
+            ):
                 focused_column = None
             if callable(save_preferences):
                 save_preferences(preferences)
@@ -368,7 +470,7 @@ def _run(
             target = focused_column or active_sort_column
             if target is None:
                 continue
-            if is_member_portfolio:
+            if is_member_view:
                 if target == member_sort_column:
                     member_sort_descending = not member_sort_descending
                 else:
@@ -379,17 +481,17 @@ def _run(
             else:
                 preferences.sort_column = target
                 preferences.sort_descending = False
-            if not is_member_portfolio and callable(save_preferences):
+            if not is_member_view and callable(save_preferences):
                 save_preferences(preferences)
             continue
-        if not is_member_portfolio and key == ord("d") and selected is not None and rows and callable(remove_symbol):
+        if not is_member_view and key == ord("d") and selected is not None and rows and callable(remove_symbol):
             remove_symbol(rows[selected].symbol)
             rows.pop(selected)
             selected = min(selected, max(0, len(rows) - 1))
             if not rows:
                 selected = None
             continue
-        if not is_member_portfolio and key == ord("a") and callable(add_symbol):
+        if not is_member_view and key == ord("a") and callable(add_symbol):
             symbol = _prompt_symbol(screen, layout.chat_y)
             if symbol and symbol not in {row.symbol for row in rows}:
                 add_symbol(symbol)
@@ -467,6 +569,28 @@ def _prompt_symbol(screen: curses.window, y: int) -> str | None:
     return None
 
 
+def _prompt_name(screen: curses.window, y: int) -> str | None:
+    prompt = " Display name: "
+    try:
+        curses.echo()
+        curses.curs_set(1)
+        screen.timeout(-1)
+        screen.move(y, 0)
+        screen.clrtoeol()
+        screen.addstr(y, 0, prompt)
+        value = screen.getstr(y, len(prompt), 80).decode("utf-8").strip()
+        return value or None
+    except (curses.error, UnicodeDecodeError):
+        return None
+    finally:
+        curses.noecho()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        screen.timeout(50)
+
+
 def _prompt_input(screen: curses.window, y: int, width: int, prefix: str) -> str | None:
     prompt = f" {prefix} "
     try:
@@ -476,7 +600,9 @@ def _prompt_input(screen: curses.window, y: int, width: int, prefix: str) -> str
         screen.move(y, 0)
         screen.clrtoeol()
         screen.addstr(y, 0, prompt, curses.A_BOLD)
-        raw = screen.getstr(y, len(prompt), max(1, width - len(prompt) - 1))
+        raw = screen.getstr(
+            y, len(prompt), min(200, max(1, width - len(prompt) - 1))
+        )
         value = raw.decode("utf-8").strip()
         return f"{prefix}{value}" if value else None
     except (curses.error, UnicodeDecodeError):
@@ -507,6 +633,8 @@ def _apply_updates(
         for row in matching_rows:
             if kind == "quote":
                 row.quote = value  # type: ignore[assignment]
+            elif kind == "live_quote" and row.quote is not None:
+                _apply_live_quote(row.quote, value)  # type: ignore[arg-type]
             elif kind == "trend":
                 row.trend = value  # type: ignore[assignment]
             elif kind == "error":
@@ -528,6 +656,28 @@ def _apply_updates(
                 row.fundamentals_done = True
 
 
+def _apply_live_quote(quote: Quote, live: LiveQuote) -> None:
+    # Yahoo MarketHoursType values: 0 pre, 1 regular, 2 post, 3 extended.
+    if live.market_hours == 1:
+        quote.price = live.price
+        quote.timestamp = live.timestamp
+        quote.change_percent = live.change_percent
+        if quote.previous_close is not None:
+            quote.change = round(live.price - quote.previous_close, 6)
+        quote.extended_hours = None
+        quote.market_state = "REGULAR"
+        return
+
+    session = "pre" if live.market_hours == 0 else "post"
+    if live.market_hours == 3 and quote.extended_hours is not None:
+        session = quote.extended_hours.session
+    change = round(live.price - quote.price, 6)
+    change_percent = round(change / quote.price * 100, 6) if quote.price else None
+    quote.extended_hours = ExtendedHours(
+        session, live.price, change, change_percent, live.timestamp
+    )
+
+
 def _draw(
     screen: curses.window,
     rows: list[PortfolioRow],
@@ -541,21 +691,24 @@ def _draw(
     preferences: Preferences,
     focused_column: str | None,
     selected_member: int | None,
+    members: tuple[CommunityMember, ...],
     portfolio_member: CommunityMember | None,
     sort_column: str | None,
     sort_descending: bool,
     input_message: str,
 ) -> None:
     screen.erase()
-    layout = calculate_layout(width, height)
+    layout = calculate_layout(
+        width, height, show_sidebar=preferences.active_tab == "community"
+    )
     _draw_tabs(screen, layout, preferences.active_tab)
     _draw_box(
         screen, 0, layout.body_y, layout.main_width, layout.body_height,
     )
     if layout.sidebar_width:
-        _draw_community_sidebar(screen, layout, selected_member, subtle_background)
+        _draw_community_sidebar(screen, layout, members, selected_member, subtle_background)
     if preferences.active_tab == "community" and portfolio_member is None:
-        _draw_community_page(screen, layout, selected_member)
+        _draw_community_page(screen, layout, members, selected_member)
         _draw_chat_bar(screen, layout, input_message)
         _draw_footer(screen, layout, preferences, False)
         screen.refresh()
@@ -570,10 +723,13 @@ def _draw(
     show_growth = preferences.view == "study" and content_width >= (178 if has_extended else 152)
     table_y = layout.body_y + (2 if portfolio_member else 1)
     if portfolio_member:
-        title = "Portfolio"
+        is_demo_portfolio = bool(portfolio_member.reporting_period)
+        title = "Portfolio" if is_demo_portfolio else "Watchlist"
         metadata = (
             f"  {portfolio_member.manager}  "
             f"{portfolio_member.reporting_period} · historical disclosure"
+            if is_demo_portfolio
+            else f"  {portfolio_member.name}"
         )
         try:
             screen.addnstr(
@@ -592,7 +748,8 @@ def _draw(
             pass
     header = _header_cells(
         rows, chart_width, has_extended, show_trends, show_cap, show_pe, show_growth,
-        sort_column, sort_descending, portfolio_member is not None,
+        sort_column, sort_descending,
+        bool(portfolio_member and portfolio_member.reporting_period),
     )
     _draw_table_header(
         screen, table_y, header, content_width,
@@ -627,7 +784,7 @@ def _draw(
             show_trends,
             ascii_only,
             highlighted,
-            portfolio_member is not None,
+            bool(portfolio_member and portfolio_member.reporting_period),
         )
         _draw_table_row(
             screen,
@@ -711,23 +868,25 @@ def _draw_box(
 def _draw_community_sidebar(
     screen: curses.window,
     layout: AppLayout,
+    members: tuple[CommunityMember, ...],
     selected_member: int | None,
     subtle_background: bool,
 ) -> None:
     x = layout.main_width
     _draw_box(screen, x, layout.body_y, layout.sidebar_width, layout.body_height)
-    for index, member in enumerate(DEFAULT_MEMBERS):
+    for index, member in enumerate(members[: max(0, layout.body_height - 3)]):
         is_selected = selected_member == index
         attribute = (
-            curses.color_pair(3) | curses.A_BOLD
-            if is_selected and subtle_background
-            else curses.A_REVERSE | curses.A_BOLD
+            curses.color_pair(6) | curses.A_BOLD
+            if is_selected and curses.has_colors()
+            else curses.A_BOLD
             if is_selected
             else 0
         )
         try:
+            label = f"{member.name} · demo" if member.reporting_period else member.name
             screen.addnstr(
-                layout.body_y + 2 + index, x + 2, f"@{member.handle}",
+                layout.body_y + 2 + index, x + 2, label,
                 max(0, layout.sidebar_width - 4), attribute,
             )
         except curses.error:
@@ -735,22 +894,28 @@ def _draw_community_sidebar(
 
 
 def _draw_community_page(
-    screen: curses.window, layout: AppLayout, selected_member: int | None
+    screen: curses.window,
+    layout: AppLayout,
+    members: tuple[CommunityMember, ...],
+    selected_member: int | None,
 ) -> None:
     if selected_member is None:
-        lines = ["Select a community member", "", "Use ↑/↓ to browse reported portfolios."]
+        lines = [
+            "Select a community member",
+            "",
+            "Use ↑/↓ to browse shared watchlists.",
+        ]
     else:
-        member = DEFAULT_MEMBERS[selected_member]
+        member = members[selected_member]
         lines = [
             f"@{member.handle}  {member.name}",
             member.manager,
-            f"Reported {member.reporting_period} · {member.report_date}",
             "",
-            "Largest disclosed holdings",
-            "  " + "  ".join(holding.symbol for holding in member.holdings),
-            "",
-            member.relationship_note,
-            "Historical disclosure · not current portfolio data",
+            (
+                "Demo based on a reported manager portfolio"
+                if member.reporting_period
+                else "Press Enter to load this member's watchlist"
+            ),
         ]
     for index, line in enumerate(lines, start=layout.body_y + 2):
         try:
@@ -760,12 +925,20 @@ def _draw_community_page(
 
 
 def _draw_chat_bar(screen: curses.window, layout: AppLayout, message: str) -> None:
-    text = f" › {message} "
+    is_join_prompt = message.startswith("Join Community")
+    prefix = "  › "
+    text = f"{prefix}{message}  "
     try:
         screen.addnstr(
             layout.chat_y, 0, text.ljust(max(0, layout.width - 1)),
             max(0, layout.width - 1), curses.A_DIM,
         )
+        if is_join_prompt and (choice_at := message.rfind("y/n")) >= 0:
+            choice_style = curses.A_BOLD
+            if curses.has_colors():
+                choice_style |= curses.color_pair(6)
+            screen.addch(layout.chat_y, len(prefix) + choice_at, "y", choice_style)
+            screen.addch(layout.chat_y, len(prefix) + choice_at + 2, "n", choice_style)
     except curses.error:
         pass
 

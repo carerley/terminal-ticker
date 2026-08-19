@@ -6,10 +6,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class CommunityHolding:
     symbol: str
-    portfolio_percent: float
+    portfolio_percent: float | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class CommunityMember:
     handle: str
     name: str
@@ -18,6 +18,19 @@ class CommunityMember:
     report_date: str
     holdings: tuple[CommunityHolding, ...]
     relationship_note: str
+
+    @classmethod
+    def from_directory(cls, value: dict[str, object]) -> "CommunityMember":
+        handle = str(value.get("handle") or "")
+        return cls(
+            handle=handle,
+            name=str(value.get("display_name") or handle),
+            manager=str(value.get("bio") or "Community member"),
+            reporting_period="",
+            report_date="",
+            holdings=(),
+            relationship_note="Shared community watchlist",
+        )
 
 
 # Default members derived from famous-investor-holdings.json. These are reported

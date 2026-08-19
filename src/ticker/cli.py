@@ -12,10 +12,12 @@ from dataclasses import dataclass
 from . import __version__
 from .core import PERIODS, Quote, QuoteError, Trend, YahooProvider, get_market_data
 from .fundamentals import Fundamentals, FundamentalsProvider
+from .identity import initialize_device_identity, sync_device_watchlist
 from .portfolio import Portfolio, PortfolioEntry
 from .profiler import Profiler
 from .render import Color, age_text, change_text, compact_number, money, pe_text, percent, sparkline, trend_line
 from .tui import PortfolioRow, run_progressive_portfolio
+from .update import check_for_update, prompt_for_update
 
 
 CHART_PERIODS = [*PERIODS, "all"]
@@ -43,27 +45,42 @@ class Result:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        prog="ticker", description="Quick no-key stock quotes and portfolio trends"
+        prog="ticker", description="Raise financial awareness without making developers switch context."
     )
-    result.add_argument("symbols", nargs="*", help="ticker symbols, or add/remove/list/clear")
-    result.add_argument("--json", action="store_true", help="emit stable JSON")
-    result.add_argument("--compact", action="store_true", help="print one compact line per symbol")
+    result.add_argument("symbol", nargs="?", help="ticker symbol to add")
+    result.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--compact", action="store_true", help=argparse.SUPPRESS)
     result.add_argument(
         "--chart",
         nargs="?",
         const="1m",
         choices=CHART_PERIODS,
         metavar="PERIOD",
-        help="show a 1d, 1w, 1m, 3m, 6m, 1y, 3y, 5y, ytd, or all-period chart",
+        help=argparse.SUPPRESS,
     )
-    result.add_argument("--no-chart", action="store_true", help="hide portfolio sparklines")
-    result.add_argument("--ascii", action="store_true", help="use ASCII charts")
-    result.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    result.add_argument("--no-chart", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--ascii", action="store_true", help=argparse.SUPPRESS)
     result.add_argument(
-        "--no-interactive", action="store_true", help="print the portfolio without row navigation"
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help=argparse.SUPPRESS,
     )
-    result.add_argument("--profile", action="store_true", help="print latency timings to stderr")
-    result.add_argument("--profile-json", metavar="PATH", help="write latency timings as JSON")
+    result.add_argument(
+        "-p",
+        "--print",
+        dest="no_interactive",
+        action="store_true",
+        help="print output without opening interactive mode",
+    )
+    result.add_argument(
+        "--no-interactive",
+        dest="no_interactive",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    result.add_argument("--profile", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--profile-json", metavar="PATH", help=argparse.SUPPRESS)
     result.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return result
 
@@ -72,9 +89,21 @@ def main(argv: list[str] | None = None) -> int:
     started_at = time.perf_counter()
     args = parser().parse_args(argv)
     profiler = Profiler(args.profile or bool(args.profile_json), started_at)
+    if (
+        args.symbol is None
+        and not args.no_interactive
+        and not profiler.enabled
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    ):
+        update = check_for_update(__version__)
+        if update is not None:
+            if prompt_for_update(update):
+                return 0
     try:
         return run(args, profiler)
     finally:
+        sync_device_watchlist([entry.symbol for entry in Portfolio().entries()])
         if args.profile:
             profiler.write_report()
         if args.profile_json:
@@ -82,50 +111,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run(args: argparse.Namespace, profiler: Profiler) -> int:
+    initialize_device_identity()
     if args.chart and args.no_chart:
         print("ticker: --chart and --no-chart cannot be used together", file=sys.stderr)
         return 2
 
     portfolio = Portfolio()
-    command = args.symbols[0].lower() if args.symbols else None
-    if command == "add":
-        symbols = normalize(args.symbols[1:])
-        if not symbols:
-            print("ticker: add requires at least one symbol", file=sys.stderr)
-            return 2
-        added = portfolio.add(symbols)
-        if args.json:
-            print(json.dumps({"added": added}))
-        else:
-            print("Added " + ", ".join(added) + "." if added else "Symbols already listed.")
-        return 0
-    if command == "clear":
-        if len(args.symbols) != 1:
-            print("ticker: clear does not accept symbols", file=sys.stderr)
-            return 2
-        count = portfolio.clear()
-        print(json.dumps({"cleared": count}) if args.json else f"Cleared {count} symbols.")
-        return 0
-    if command in {"forget", "remove"}:
-        if len(args.symbols) < 2:
-            print("ticker: remove requires at least one symbol", file=sys.stderr)
-            return 2
-        removed = portfolio.forget([symbol.upper() for symbol in args.symbols[1:]])
-        if args.json:
-            print(json.dumps({"forgotten": removed}))
-        else:
-            print("Forgot " + ", ".join(removed) + "." if removed else "No matching symbols.")
-        return 0
-
-    portfolio_mode = not args.symbols or command == "list"
-    if command == "list" and len(args.symbols) != 1:
-        print("ticker: list does not accept symbols", file=sys.stderr)
-        return 2
+    portfolio_mode = args.symbol is None
     with profiler.span("load_portfolio"):
         entries = portfolio.entries() if portfolio_mode else []
     if portfolio_mode and not entries:
         empty_interactive = (
-            not args.symbols
+            args.symbol is None
             and not args.json
             and not args.no_interactive
             and not profiler.enabled
@@ -146,7 +143,7 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
         print("[]" if args.json else "No recent symbols. Try: ticker AAPL")
         return 0
 
-    symbols = [entry.symbol for entry in entries] if portfolio_mode else normalize(args.symbols)
+    symbols = [entry.symbol for entry in entries] if portfolio_mode else normalize([args.symbol])
     if symbols is None:
         return 2
     period = None if args.no_chart else (args.chart or ("1m" if portfolio_mode else None))
@@ -155,7 +152,7 @@ def run(args: argparse.Namespace, profiler: Profiler) -> int:
     entry_map = {entry.symbol: entry for entry in entries}
     interactive = (
         portfolio_mode
-        and not args.symbols
+        and args.symbol is None
         and not args.json
         and not args.no_interactive
         and not profiler.enabled

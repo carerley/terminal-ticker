@@ -9,7 +9,12 @@ from pathlib import Path
 
 def state_directory() -> Path:
     root = os.environ.get("XDG_STATE_HOME")
-    return Path(root) / "ticker" if root else Path.home() / ".local" / "state" / "ticker"
+    if root:
+        return Path(root) / "ticker"
+    config_root = os.environ.get("XDG_CONFIG_HOME")
+    if config_root:
+        return Path(config_root) / "ticker" / "state"
+    return Path.home() / ".local" / "state" / "ticker"
 
 
 @dataclass

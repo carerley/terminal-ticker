@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Ticker: Interactive",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "ticker",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "TICKER_API_URL": "http://127.0.0.1:8000"
+            }
+        }
+    ]
+}
